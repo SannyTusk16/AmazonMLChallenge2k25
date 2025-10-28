@@ -6,15 +6,90 @@ This repository contains the code and instructions for the Smart Product Pricing
 
 This README explains the dataset, required output format, evaluation metric (SMAPE), recommended modeling approaches, and submission instructions.
 
+
+### Data Processing Flow
+
+```mermaid
+graph TD
+    A[Load Dataset] --> B[Parse catalog_content]
+    B --> C[Extract Structured Fields: Item Name, Bullet Points, Description, Value, Unit]
+    C --> D[Normalize Units]
+    D --> E[Compute Derived Features: Quantity, Weight Category, etc.]
+    E --> F[Text Embeddings via Transformer + BiLSTM]
+    A --> G[Download Images]
+    G --> H[Image Embeddings via EfficientNet]
+    F --> I[Fusion via Transformer]
+    H --> I
+    E --> I
+    I --> J[Predict log(price)]
+    J --> K[Inverse Transform to Price]
+    K --> L[Compute SMAPE]
+```
+
 ## Repository structure
 
-- `dataset/` — expected location for `train.csv`, `test.csv`, and sample files
-- `src/` — code and utilities (e.g., `src/utils.py` for image downloading)
-- `sample_code.py` — optional example that shows how to produce a submission file
-- `Documentation_template.md` — template for the required 1-page methodology document
-- `README.md` — this file
+- `code.ipynb` — Main notebook for data parsing and initial experiments
+- `README.md` — This file
+- `approach8/` — Text-based approach using BiLSTM on catalog content
+  - `code.ipynb` — Fine-tuning notebook for the pre-trained model
+  - `model/` — Pre-trained model artifacts
+    - `model_config.json`
+    - `model_weights.weights.h5`
+    - `saved_model.keras`
+    - `vectorizer_config.json`
+- `approach9/` — Multi-modal approach with text parsing, BiLSTM, and fusion
+  - `code.ipynb` — Initial implementation
+  - `code_v2.ipynb` — Updated version
+  - `context.txt` — Detailed description of the approach
+- `kamal/` — Kaggle-style notebook approach
+  - `kaggele-noptebook (1).ipynb`
 
-If any of these files are missing in your local copy, place the dataset files under `dataset/` and the code under `src/` as described above.
+Note: Dataset files (`train.csv`, `test.csv`) should be placed in a `dataset/` folder. Utility scripts are in `src/` if available.
+
+## Overall Approach
+
+The project employs a multi-modal machine learning strategy to predict product prices from catalog content and images. The approach involves:
+
+1. **Data Parsing and Feature Engineering**: Parse the `catalog_content` into structured fields like item name, bullet points, description, value, unit, etc. Extract numeric and categorical features, normalize units, and compute derived features.
+
+2. **Text Processing**: Use transformer-based embeddings for token-level representations, aggregated via BiLSTM for contextual understanding.
+
+3. **Image Processing**: Extract embeddings using pre-trained vision models like EfficientNet.
+
+4. **Fusion and Prediction**: Combine text, image, and structured features through a fusion transformer or MLP to predict log-transformed prices, evaluated on SMAPE.
+
+Multiple approaches are explored, ranging from text-only models to full multi-modal fusion.
+
+## Approaches
+
+### Approach 8: Text-based BiLSTM Model
+This approach focuses on text-only features from the `catalog_content`. It uses a pre-trained embedding model fine-tuned with BiLSTM layers (64 units each) followed by a dense layer for price prediction. The model is trained on log-transformed prices and evaluated using SMAPE, MSE, MAE, and R².
+
+- **Key Components**:
+  - Text vectorization and embedding
+  - Two BiLSTM layers
+  - Dense output layer
+- **Training**: Fine-tuned on the training dataset with 80-20 train-val split.
+- **Artifacts**: Pre-trained model and vectorizer configs saved in `approach8/model/`.
+
+### Approach 9: Multi-modal Fusion with BiLSTM and Transformer
+A comprehensive multi-modal approach that parses `catalog_content` into structured fields, extracts text embeddings via transformers and BiLSTM, image embeddings from EfficientNet, and fuses them using a small Transformer encoder.
+
+- **Key Components**:
+  - Data parsing: Extract item name, bullet points, description, value, unit, etc.
+  - Unit normalization and derived features (e.g., quantity, weight category)
+  - Text encoder: Transformer (e.g., BERT) for token embeddings, aggregated by BiLSTM
+  - Image encoder: EfficientNet for embeddings
+  - Fusion: Transformer-based fusion of text, image, and structured features
+  - Prediction: MLP head predicting log(price), inverted for SMAPE evaluation
+- **Training**: Predict log1p(price) with MSE loss, evaluate SMAPE on original scale.
+- **Details**: See `approach9/context.txt` for in-depth description.
+
+### Kamal: Kaggle-Style Notebook Approach
+A notebook-based implementation following Kaggle competition style, likely incorporating data parsing, feature engineering, and model training in a single notebook.
+
+- **Key Components**: Data parsing, clustering, and potentially ensemble models.
+- **Notebook**: `kamal/kaggele-noptebook (1).ipynb`
 
 ## Problem statement (short)
 
@@ -139,3 +214,20 @@ The relationship between product attributes and price is complex. Consider a mul
 
 7. Cross-validation
 	- Use k-fold CV (e.g., 5 folds) and keep test-time ensembling consistent with CV splits.
+
+
+
+### Model Architecture for Approach 9
+
+```mermaid
+graph TD
+    A[Text Input] --> B[Transformer Encoder]
+    B --> C[BiLSTM Aggregator]
+    D[Image Input] --> E[EfficientNet Encoder]
+    F[Structured Features] --> G[MLP Projection]
+    C --> H[Fusion Transformer]
+    E --> H
+    G --> H
+    H --> I[MLP Head]
+    I --> J[log(price) Prediction]
+```
