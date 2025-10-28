@@ -1,0 +1,168 @@
+1) High-level overview (one-line)
+
+Parse catalog_content → structured columns (Item Name, Bullet Points, Description, Value, Unit, Combo, brand, etc.).
+Standardize units & compute derived numeric columns (quantity, price_per_unit, weight_category).
+Text token-level embeddings via a transformer (use token outputs, not just pooled vector). Pass token embeddings through a BiLSTM to get an aggregated text representation.
+Image embeddings from EfficientNet (timm) — optionally fine-tune.
+Fuse text (BiLSTM output), image embedding, and structured numeric/categorical features using a small Fusion Transformer (or MLP if compute-limited).
+Predict y = log1p(price) (train with MSE or MAE). On inference apply expm1 to get original currency, then compute SMAPE on original scale.
+
+
+2) Data parsing & feature engineering
+A. Parse catalog_content into columns
+Use regex + simple rule-based parsing. Typical fields:
+
+Item Name (required) — left part before first newline or "Item Name:" label.
+Bullet Points — collect all Bullet Point <n>: sections (concatenate with separator ||).
+Product Description — Product Description: section if present.
+Value — numeric(s) found near unit tokens. Use regex like (\d+[\.,]?\d*)\s*(unit_word) or (\d+/\d+|[\d.]+); convert commas.
+Unit — the token after the value (normalize below).
+Combo — binary flag if pack, combo, set of, bundle, value pack, 2-in-1, 3 Pack, multi pack, pack of, qty etc. appear in Item Name or Bullet Points. Use case-insensitive pattern.
+Brand — often first token in Item Name or look for known brand dictionary; fallback to first word.
+BulletPointCount — count of bullet points.
+TextLength — character or token length of catalog_content.
+HasDescription — boolean if Product Description exists.
+NumericValueMissing — boolean if Value not found.
+PricePerUnit — compute when both price & value exist: price / value. (Compute after splitting into train/val to avoid leakage? It's derived from target, so use only for EDA; do not use price_per_unit as feature for training. But you can compute unit_value (value normalized) as feature because it’s from input.)
+
+Important: PricePerUnit depends on target — avoid using as feature for model training unless you only use value (input) and not true price.
+B. Unit normalization
+Map the raw unit tokens to canonical set:
+kg, g, mg, lb, oz, l, ml, count, bottle, pack, box, piece, jar, tin, case, bag, packet, sachet, unit, m, cm, in, ft
+
+    unit_mappings = {
+        "ounces": "oz", "ounce": "oz", "oz": "oz",
+        "pounds": "lb", "pound": "lb", "lbs": "lb", "lb": "lb",
+        "grams": "g", "gram": "g", "gr": "g", "g": "g",
+        "kilograms": "kg", "kilogram": "kg", "kg": "kg",
+        "liters": "l", "liter": "l", "liters": "l", "ltr": "l", "l": "l",
+        "milliliters": "ml", "milliliter": "ml", "millilitro": "ml", "ml": "ml",
+        "fluid": "fl", "fl": "fl"
+    }
+Lowercase everything first. If unit absent, set unit='count'.
+
+C. Derived numeric columns (do this from input fields only)
+
+value_numeric (float) — the parsed Value (e.g., 250, 0.5, etc.).
+value_in_g or value_in_ml — convert to base units for weight/volume (e.g., if unit is kg, value_in_g = value_numeric * 1000).
+quantity — if Item Name contains 2 pk, 12x, 6 pack, normalize to integer.
+weight_category — bucket value_in_g into bins (e.g., <50g, 50-200g, 200-1000g, >1000g).
+price_log_target — see below.
+
+D. What to keep as raw strings vs structured
+Keep these as strings (for text encoder):
+
+Item Name (string)
+Bullet Points (concatenated string)
+Product Description (string)
+catalog_content (optionally, for additional raw context)
+
+Keep these as structured (not raw strings):
+
+Value → numeric
+Unit → categorical (normalized)
+Combo → binary
+Brand → categorical (one-hot or embedding)
+BulletPointCount, TextLength, HasDescription, NumericValueMissing → numeric/binary
+Image → file path (load and transform)
+
+Rationale: text encoders digest free text; structured features are easier to learn from as numeric inputs and reduce reliance on the text encoder to parse simple numeric facts.
+
+3) Target transform: log1p & SMAPE details
+You said you want to minimize SMAPE (symmetric mean absolute percentage error). Important behavior:
+
+SMAPE formula for true y and predicted ŷ:
+
+
+  \text{SMAPE} = \frac{1}{N} \sum_{i=1}^N \frac{2|y_i - \hat y_i|}{|y_i| + |\hat y_i| + \epsilon}
+
+
+Do a log transform because prices are skewed. Common transform: y_t = log1p(y) (i.e. log(1+y)) — handles zeros.
+
+Key practical detail: If the competition evaluates SMAPE on original price scale, you must invert your prediction before computing SMAPE.
+Flow:
+
+Train model to predict y_t = log1p(y).
+At inference: ŷ_t = model(x) → ŷ = expm1(ŷ_t) (np.expm1).
+Compute SMAPE using y and ŷ in original units.
+
+Loss to train with:
+
+MSE on y_t (i.e., MSE(log1p(y))) is common. You can also try MAE on y_t.
+Optionally you can train using a custom loss approximating SMAPE by computing SMAPE on the inverse-transformed predictions inside the loss — but that’s non-linear & unstable. Better to train on log-target and monitor validation SMAPE on original scale.
+
+Why this works: optimizing on log-space reduces relative error for low-price items and stabilizes training; inverse back to original for final SMAPE.
+Numeric example:
+
+y = 100 → y_t = log1p(100) ≈ 4.6151
+Model outputs ŷ_t = 4.6 → ŷ = expm1(4.6) ≈ 99.48
+Compute SMAPE between 100 and 99.48.
+
+
+4) Model architecture — BiLSTM + Transformer hybrid (detailed)
+Overview (component stack)
+
+
+Text encoder (transformer token-level)
+
+Choose: sentence-transformers/all-mpnet-base-v2 (strong sentence encoder) OR bert-base-uncased (if you want token-level huggingface transformer).
+Use the transformer outputs per token (hidden states for each token) — do not only use [CLS] pooled vector.
+
+
+
+Text aggregator (BiLSTM)
+
+BiLSTM over token embeddings → get contextual sequential aggregation.
+Options for output: use the BiLSTM final hidden state (concatenate forward + backward), or mean pooling across time steps.
+
+
+
+Image encoder
+
+Use EfficientNet (timm: efficientnet_b3 or efficientnet_b4) pre-trained on ImageNet.
+Take the penultimate layer embedding (Global Pool) — a single vector per image.
+Optionally: use clip-vit-base-patch32 if your text and images should be aligned — CLIP gives joint space.
+
+
+
+Structured features branch
+
+Pass numeric features through a small MLP (batchnorm → dense → ReLU → dropout).
+Categorical features → embeddings (learned) and optionally pass through small MLP.
+
+
+
+Fusion block (Transformer-based fusion)
+
+Create a short multimodal sequence of tokens:
+
+Text token: the BiLSTM output vector(s) can be split into a small sequence or use 1 token representing text.
+Image token: project image embedding to same dimensionality and treat as token(s).
+Structured token: project structured features as a token.
+
+
+Run a small Transformer Encoder (2–4 layers) over this short sequence (this acts as cross-attention and lets modalities interact).
+Output: mean pool / take the [0] token, pass to final MLP.
+
+
+
+Head (MLP → prediction)
+
+MLP: Dense(512)->ReLU->Dropout->Dense(128)->ReLU->Dense(1) predicting y_t = log1p(price).
+
+
+
+Exact shapes & hyperparams (suggested)
+
+Transformer token dims (text & fusion): d_model = 768
+Text encoder: bert-base-uncased hidden size 768. Use last hidden states (seq_len x 768).
+BiLSTM: input_size=768, hidden_size=384, num_layers=1, bidirectional=True → output size 768 (384*2).
+Image embedding: EfficientNet-B3 global pool 1536 → project with Linear(1536, 768) + LayerNorm.
+Structured features projection: Linear(n_struct, 768) where n_struct is #structured features after embedding.
+Fusion Transformer: 2 layers, 8 heads, feed-forward 3072, dropout 0.1.
+Final MLP: 768 -> 512 -> 128 -> 1.
+
+
+(USE OPTUNA TO TUNE THE HYPERPARAMETERS, WITH A VARIABLE TO CHOOSE % of training data to use for optuna) 
+
+
